@@ -1,0 +1,456 @@
+import { mdiDotsVertical, mdiDownload, mdiRefresh, mdiText } from "@mdi/js";
+import type { HassConfig } from "home-assistant-js-websocket";
+import type { PropertyValues } from "lit";
+import { css, html, LitElement, nothing } from "lit";
+import { customElement, property, state } from "lit/decorators";
+import { styleMap } from "lit/directives/style-map";
+import memoizeOne from "memoize-one";
+import { fireEvent } from "../../../common/dom/fire_event";
+import type { HASSDomCurrentTargetEvent } from "../../../common/dom/fire_event";
+import type { LocalizeFunc } from "../../../common/translations/localize";
+import "../../../components/animation/ha-fade-in";
+import "../../../components/buttons/ha-call-service-button";
+import "../../../components/ha-alert";
+import "../../../components/ha-card";
+import "../../../components/ha-dropdown";
+import "../../../components/ha-dropdown-item";
+import "../../../components/ha-icon-button";
+import "../../../components/item/ha-list-item-button";
+import "../../../components/list/ha-list-base";
+import "../../../components/skeleton/ha-skeleton-text";
+import { getSignedPath } from "../../../data/auth";
+import {
+  getCoreLogFileDownloadUnavailableReason,
+  getErrorLogDownloadUrl,
+} from "../../../data/error_log";
+import { domainToName } from "../../../data/integration";
+import { formatListWithAnds } from "../../../common/string/format-list";
+import type { LoggedError, SystemLogLevel } from "../../../data/system_log";
+import {
+  fetchSystemLog,
+  getLoggedErrorIntegration,
+  isCustomIntegrationError,
+} from "../../../data/system_log";
+import type { FrontendLocaleData } from "../../../data/translation";
+import type { HomeAssistant } from "../../../types";
+import { fileDownload } from "../../../util/file_download";
+import { showSystemLogDetailDialog } from "./show-dialog-system-log-detail";
+import {
+  filterSystemLogItems,
+  formatSystemLogMultipleMessages,
+  formatSystemLogTime,
+} from "./util";
+import type { HaDropdownSelectEvent } from "../../../components/ha-dropdown";
+
+// Primary and secondary line widths, in percent, for the loading rows
+const SKELETON_ROW_WIDTHS = [
+  [72, 40],
+  [56, 48],
+  [84, 36],
+  [64, 44],
+];
+
+@customElement("system-log-card")
+export class SystemLogCard extends LitElement {
+  @property({ attribute: false }) public hass!: HomeAssistant;
+
+  @property() public filter = "";
+
+  @property() public header?: string;
+
+  @property({ attribute: false }) public integrations?: string[];
+
+  @property({ attribute: false }) public integrationLoggers?: string[];
+
+  @property({ attribute: false }) public levels?: SystemLogLevel[];
+
+  public loaded = false;
+
+  @state() private _items?: LoggedError[];
+
+  public async fetchData(): Promise<void> {
+    this._items = undefined;
+    this._items = await fetchSystemLog(this.hass!);
+  }
+
+  private _timestamp(item: LoggedError): string {
+    return formatSystemLogTime(
+      item.timestamp,
+      this.hass.locale,
+      this.hass.config
+    );
+  }
+
+  private _multipleMessages(item: LoggedError): string {
+    return formatSystemLogMultipleMessages(
+      item,
+      this.hass.localize,
+      this.hass.locale,
+      this.hass.config
+    );
+  }
+
+  private _getFilteredItems = memoizeOne(
+    (
+      localize: LocalizeFunc,
+      locale: FrontendLocaleData,
+      config: HassConfig,
+      items: LoggedError[],
+      search: string,
+      loggers: string[] | undefined,
+      levels: SystemLogLevel[] | undefined
+    ) =>
+      filterSystemLogItems(
+        items,
+        { search, loggers, levels },
+        localize,
+        locale,
+        config
+      )
+  );
+
+  protected render() {
+    const logFileDownloadUnavailableReason =
+      getCoreLogFileDownloadUnavailableReason(this.hass);
+    const filteredItems = this._items
+      ? this._getFilteredItems(
+          this.hass.localize,
+          this.hass.locale,
+          this.hass.config,
+          this._items,
+          this.filter,
+          this.integrations?.length ? this.integrationLoggers : undefined,
+          this.levels
+        )
+      : [];
+    const integrations = filteredItems.length
+      ? filteredItems.map((item) => getLoggedErrorIntegration(item))
+      : [];
+    return html`
+      <div class="system-log-intro">
+        <ha-card outlined>
+          <div class="header">
+            <h1 class="card-header">
+              ${
+                this.header ||
+                this.hass.localize("ui.panel.config.logs.caption")
+              }
+            </h1>
+            <div class="header-buttons">
+              ${
+                logFileDownloadUnavailableReason
+                  ? nothing
+                  : html`<ha-icon-button
+                      .path=${mdiDownload}
+                      @click=${this._downloadLogs}
+                      .label=${this.hass.localize(
+                        "ui.panel.config.logs.download_logs"
+                      )}
+                    ></ha-icon-button>`
+              }
+              <ha-icon-button
+                .path=${mdiRefresh}
+                @click=${this.fetchData}
+                .label=${this.hass.localize("ui.common.refresh")}
+              ></ha-icon-button>
+
+              ${
+                logFileDownloadUnavailableReason && !this.integrations?.length
+                  ? nothing
+                  : html`<ha-dropdown @wa-select=${this._handleOverflowAction}>
+                      <ha-icon-button
+                        slot="trigger"
+                        .path=${mdiDotsVertical}
+                        .label=${this.hass.localize("ui.common.menu")}
+                      ></ha-icon-button>
+                      <ha-dropdown-item value="show-full-logs">
+                        <ha-svg-icon slot="icon" .path=${mdiText}></ha-svg-icon>
+                        ${this.hass.localize(
+                          "ui.panel.config.logs.show_full_logs"
+                        )}
+                      </ha-dropdown-item>
+                    </ha-dropdown>`
+              }
+            </div>
+          </div>
+          ${
+            logFileDownloadUnavailableReason
+              ? html`<ha-alert alert-type="warning">
+                  ${this.hass.localize(
+                    `ui.panel.config.logs.log_file_disabled.${logFileDownloadUnavailableReason}`
+                  )}
+                </ha-alert>`
+              : nothing
+          }
+          ${
+            this._items === undefined
+              ? html`<ha-fade-in .duration=${300} easing="ease-in">
+                  <div
+                    class="skeleton"
+                    role="progressbar"
+                    aria-label=${this.hass.localize(
+                      "ui.panel.config.logs.loading_log"
+                    )}
+                  >
+                    ${SKELETON_ROW_WIDTHS.map(
+                      ([primary, secondary]) => html`
+                        <div class="skeleton-row">
+                          <ha-skeleton-text
+                            class="primary"
+                            style=${styleMap({
+                              "--ha-skeleton-text-width": `${primary}%`,
+                            })}
+                          ></ha-skeleton-text>
+                          <ha-skeleton-text
+                            class="secondary"
+                            style=${styleMap({
+                              "--ha-skeleton-text-width": `${secondary}%`,
+                            })}
+                          ></ha-skeleton-text>
+                        </div>
+                      `
+                    )}
+                  </div>
+                </ha-fade-in>`
+              : this._items.length === 0
+                ? html`
+                    <div class="card-content empty-content">
+                      ${this.hass.localize("ui.panel.config.logs.no_issues")}
+                    </div>
+                  `
+                : filteredItems.length === 0 &&
+                    (this.filter ||
+                      this.integrations?.length ||
+                      this.levels?.length)
+                  ? html`<div class="card-content">
+                      ${
+                        this.filter
+                          ? this.hass.localize(
+                              "ui.panel.config.logs.no_issues_search",
+                              { term: this.filter }
+                            )
+                          : this.levels?.length
+                            ? this.hass.localize(
+                                "ui.panel.config.logs.no_issues_filters"
+                              )
+                            : this.hass.localize(
+                                "ui.panel.config.logs.no_issues_integration",
+                                {
+                                  integration: formatListWithAnds(
+                                    this.hass.locale,
+                                    this.integrations!.map((domain) =>
+                                      domainToName(this.hass.localize, domain)
+                                    )
+                                  ),
+                                }
+                              )
+                      }
+                    </div>`
+                  : html`<ha-list-base
+                      aria-label=${
+                        this.header ||
+                        this.hass.localize("ui.panel.config.logs.caption")
+                      }
+                      >${filteredItems.map(
+                        (item, idx) => html`
+                          <ha-list-item-button
+                            @click=${this._openLog}
+                            .logItem=${item}
+                            .headline=${item.message[0]}
+                          >
+                            <span slot="supporting-text" class="secondary">
+                              ${this._timestamp(item)} –
+                              ${html`(<span class=${item.level}
+                                  >${this.hass.localize(
+                                    `ui.panel.config.logs.level.${item.level}`
+                                  )}</span
+                                >) `}
+                              ${
+                                integrations[idx]
+                                  ? `${domainToName(
+                                      this.hass!.localize,
+                                      integrations[idx]!
+                                    )}${
+                                      isCustomIntegrationError(item)
+                                        ? ` (${this.hass.localize(
+                                            "ui.panel.config.logs.custom_integration"
+                                          )})`
+                                        : ""
+                                    }`
+                                  : item.source[0]
+                              }
+                              ${
+                                item.count > 1
+                                  ? html` - ${this._multipleMessages(item)} `
+                                  : nothing
+                              }
+                            </span>
+                          </ha-list-item-button>
+                        `
+                      )}</ha-list-base
+                    >`
+          }
+          ${
+            this._items === undefined
+              ? nothing
+              : html`<div class="card-actions">
+                  <ha-call-service-button domain="system_log" service="clear"
+                    >${this.hass.localize(
+                      "ui.panel.config.logs.clear"
+                    )}</ha-call-service-button
+                  >
+                </div>`
+          }
+        </ha-card>
+      </div>
+    `;
+  }
+
+  protected firstUpdated(changedProps: PropertyValues<this>): void {
+    super.firstUpdated(changedProps);
+    this.fetchData();
+    this.loaded = true;
+    this.addEventListener("hass-service-called", (ev) =>
+      this.serviceCalled(ev)
+    );
+  }
+
+  protected updated(changedProps: PropertyValues): void {
+    super.updated(changedProps);
+
+    if (changedProps.has("_items")) {
+      fireEvent(this, "system-log-items-changed", { items: this._items });
+    }
+  }
+
+  protected serviceCalled(ev): void {
+    // Check if this is for us
+    if (ev.detail.success && ev.detail.domain === "system_log") {
+      // Do the right thing depending on service
+      if (ev.detail.service === "clear") {
+        this._items = [];
+      }
+    }
+  }
+
+  private _handleOverflowAction(ev: HaDropdownSelectEvent) {
+    if (ev.detail.item.value === "show-full-logs") {
+      // @ts-ignore
+      fireEvent(this, "switch-log-view");
+    }
+  }
+
+  private async _downloadLogs() {
+    if (getCoreLogFileDownloadUnavailableReason(this.hass)) {
+      return;
+    }
+
+    const timeString = new Date().toISOString().replace(/:/g, "-");
+    const downloadUrl = getErrorLogDownloadUrl(this.hass);
+    const logFileName = `home-assistant_${timeString}.log`;
+    const signedUrl = await getSignedPath(this.hass, downloadUrl);
+    fileDownload(signedUrl.path, logFileName);
+  }
+
+  private _openLog(
+    ev: HASSDomCurrentTargetEvent<HTMLElement & { logItem: LoggedError }>
+  ): void {
+    const item = (ev.currentTarget as any).logItem;
+    showSystemLogDetailDialog(this, { item });
+  }
+
+  static styles = css`
+    ha-card {
+      padding-top: 8px;
+    }
+
+    :host {
+      direction: var(--direction);
+    }
+    ha-list-base {
+      direction: ltr;
+      --ha-list-padding: var(--ha-space-2) 0;
+    }
+
+    .header {
+      display: flex;
+      justify-content: space-between;
+      padding: 0 16px;
+    }
+
+    .header-buttons {
+      display: flex;
+      align-items: flex-start;
+    }
+
+    .card-header {
+      color: var(--ha-card-header-color, var(--primary-text-color));
+      font-family: var(--ha-card-header-font-family, inherit);
+      font-size: var(--ha-card-header-font-size, var(--ha-font-size-2xl));
+      letter-spacing: -0.012em;
+      line-height: var(--ha-line-height-expanded);
+      display: block;
+      margin-block-start: 0px;
+      font-weight: var(--ha-font-weight-normal);
+    }
+
+    .system-log-intro {
+      margin: 16px;
+    }
+
+    .skeleton {
+      direction: ltr;
+      padding: var(--ha-space-2) 0;
+    }
+
+    .skeleton-row {
+      display: flex;
+      flex-direction: column;
+      justify-content: center;
+      gap: var(--ha-space-2);
+      height: 72px;
+      padding: 0 var(--ha-space-5);
+    }
+
+    .skeleton-row .primary {
+      font-size: var(--ha-font-size-l);
+    }
+
+    .skeleton-row .secondary {
+      font-size: var(--ha-font-size-m);
+    }
+
+    .secondary {
+      unicode-bidi: isolate;
+      direction: var(--direction);
+    }
+
+    .error {
+      color: var(--error-color);
+    }
+
+    .warning {
+      color: var(--warning-color);
+    }
+
+    .card-content {
+      border-top: 1px solid var(--divider-color);
+      padding-top: 16px;
+      padding-bottom: 16px;
+    }
+
+    .row-secondary {
+      text-align: left;
+    }
+  `;
+}
+
+declare global {
+  interface HTMLElementTagNameMap {
+    "system-log-card": SystemLogCard;
+  }
+
+  interface HASSDomEvents {
+    "system-log-items-changed": { items: LoggedError[] | undefined };
+  }
+}

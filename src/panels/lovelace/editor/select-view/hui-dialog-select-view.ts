@@ -1,0 +1,293 @@
+import { mdiViewDashboard } from "@mdi/js";
+import type { CSSResultGroup } from "lit";
+import { css, html, LitElement, nothing } from "lit";
+import { customElement, state } from "lit/decorators";
+import { fireEvent } from "../../../../common/dom/fire_event";
+import "../../../../components/ha-alert";
+import "../../../../components/ha-button";
+import "../../../../components/ha-dialog";
+import "../../../../components/ha-dialog-footer";
+import "../../../../components/ha-icon";
+import "../../../../components/ha-select";
+import "../../../../components/ha-spinner";
+import "../../../../components/ha-svg-icon";
+import "../../../../components/item/ha-list-item-option";
+import "../../../../components/list/ha-list-selectable";
+import type { LovelaceConfig } from "../../../../data/lovelace/config/types";
+import { fetchConfig } from "../../../../data/lovelace/config/types";
+import { isStrategyView } from "../../../../data/lovelace/config/view";
+import type { LovelaceDashboard } from "../../../../data/lovelace/dashboard";
+import { fetchDashboards } from "../../../../data/lovelace/dashboard";
+import { LOVELACE_PANEL } from "../../../../data/panel";
+import { haStyleDialog } from "../../../../resources/styles";
+import type { HomeAssistant, ValueChangedEvent } from "../../../../types";
+import type { SelectViewDialogParams } from "./show-select-view-dialog";
+
+declare global {
+  interface HASSDomEvents {
+    "view-selected": {
+      view: number;
+    };
+  }
+}
+
+@customElement("hui-dialog-select-view")
+export class HuiDialogSelectView extends LitElement {
+  public hass!: HomeAssistant;
+
+  @state() private _params?: SelectViewDialogParams;
+
+  @state() private _dashboards: LovelaceDashboard[] = [];
+
+  @state() private _urlPath?: string | null;
+
+  @state() private _config?: LovelaceConfig;
+
+  @state() private _selectedViewIdx = 0;
+
+  @state() private _loading = false;
+
+  @state() private _open = false;
+
+  public showDialog(params: SelectViewDialogParams): void {
+    this._config = params.lovelaceConfig;
+    this._urlPath = params.urlPath;
+    this._selectedViewIdx = 0;
+    this._loading = false;
+    this._params = params;
+    this._open = true;
+    if (this._params.allowDashboardChange) {
+      this._getDashboards();
+    }
+  }
+
+  public closeDialog(): void {
+    this._open = false;
+  }
+
+  private _dialogClosed(): void {
+    this._params = undefined;
+    fireEvent(this, "dialog-closed", { dialog: this.localName });
+  }
+
+  protected render() {
+    if (!this._params) {
+      return nothing;
+    }
+
+    return html`
+      <ha-dialog
+        .open=${this._open}
+        header-title=${
+          this._params.header ||
+          this.hass.localize("ui.panel.lovelace.editor.select_view.header")
+        }
+        @closed=${this._dialogClosed}
+      >
+        ${
+          this._params.allowDashboardChange
+            ? html`<ha-select
+                .label=${this.hass.localize(
+                  "ui.panel.lovelace.editor.select_view.dashboard_label"
+                )}
+                .disabled=${!this._dashboards.length}
+                .value=${this._urlPath ?? LOVELACE_PANEL}
+                @selected=${this._dashboardChanged}
+                autofocus
+                .options=${this._dashboards
+                  .map((dashboard) => ({
+                    value: dashboard.url_path,
+                    label: `${dashboard.title}${dashboard.id === LOVELACE_PANEL ? ` (${this.hass.localize("ui.common.default")})` : ""}`,
+                    disabled: dashboard.mode !== "storage",
+                  }))
+                  .sort((a, b) =>
+                    a.value === LOVELACE_PANEL
+                      ? -1
+                      : b.value === LOVELACE_PANEL
+                        ? 1
+                        : a.label.localeCompare(b.label)
+                  )}
+              >
+              </ha-select>`
+            : nothing
+        }
+        ${this._renderViews()}
+        <ha-dialog-footer slot="footer">
+          <ha-button
+            slot="secondaryAction"
+            @click=${this.closeDialog}
+            appearance="plain"
+          >
+            ${this.hass!.localize("ui.common.cancel")}
+          </ha-button>
+          <ha-button
+            slot="primaryAction"
+            .disabled=${!this._selectableConfig}
+            @click=${this._selectView}
+          >
+            ${this._params.actionLabel || this.hass!.localize("ui.common.move")}
+          </ha-button>
+        </ha-dialog-footer>
+      </ha-dialog>
+    `;
+  }
+
+  // While a config is loading the views on screen still belong to the
+  // previously selected dashboard, so nothing may be picked from them.
+  private get _selectableConfig(): LovelaceConfig | undefined {
+    return !this._loading && this._config?.views?.length
+      ? this._config
+      : undefined;
+  }
+
+  private _renderViews() {
+    if (this._loading) {
+      return html`<div class="loading">
+        <ha-spinner size="medium"></ha-spinner>
+      </div>`;
+    }
+
+    if (!this._selectableConfig) {
+      return html`<ha-alert alert-type="error">
+        ${this.hass.localize(
+          this._config
+            ? "ui.panel.lovelace.editor.select_view.no_views"
+            : "ui.panel.lovelace.editor.select_view.no_config"
+        )}
+      </ha-alert>`;
+    }
+
+    const views = this._selectableConfig.views;
+
+    const dashboardTitle = this._params?.allowDashboardChange
+      ? this._dashboards.find(
+          (dashboard) =>
+            dashboard.url_path === (this._urlPath ?? LOVELACE_PANEL)
+        )?.title
+      : undefined;
+    const viewsHeading = dashboardTitle
+      ? this.hass.localize(
+          "ui.panel.lovelace.editor.select_view.views_heading",
+          { dashboard: dashboardTitle }
+        )
+      : undefined;
+
+    return html`
+      ${viewsHeading ? html`<h3>${viewsHeading}</h3>` : nothing}
+      <ha-list-selectable
+        aria-label=${
+          viewsHeading ??
+          this.hass.localize("ui.panel.lovelace.editor.select_view.views_label")
+        }
+        @ha-list-item-selected=${this._viewChanged}
+      >
+        ${views.map((view, idx) => {
+          const isStrategy = isStrategyView(view);
+
+          return html`
+            <ha-list-item-option
+              .selected=${this._selectedViewIdx === idx}
+              .disabled=${isStrategy && !this._params?.includeStrategyViews}
+              ?autofocus=${idx === 0 && !this._params!.allowDashboardChange}
+            >
+              ${
+                view.icon
+                  ? html`<ha-icon slot="start" .icon=${view.icon}></ha-icon>`
+                  : html`<ha-svg-icon
+                      slot="start"
+                      .path=${mdiViewDashboard}
+                    ></ha-svg-icon>`
+              }
+              <span slot="headline">
+                ${
+                  view.title ||
+                  this.hass.localize("ui.panel.lovelace.views.unnamed_view")
+                }${
+                  isStrategy
+                    ? ` (${this.hass.localize("ui.panel.lovelace.editor.select_view.strategy_type")})`
+                    : nothing
+                }
+              </span>
+            </ha-list-item-option>
+          `;
+        })}
+      </ha-list-selectable>
+    `;
+  }
+
+  private async _getDashboards() {
+    this._dashboards =
+      this._params!.dashboards || (await fetchDashboards(this.hass));
+  }
+
+  private async _dashboardChanged(ev: ValueChangedEvent<string>) {
+    const urlPath = ev.detail.value === LOVELACE_PANEL ? null : ev.detail.value;
+    if (urlPath === this._urlPath) {
+      return;
+    }
+    this._urlPath = urlPath;
+    this._loading = true;
+    let config: LovelaceConfig | undefined;
+    try {
+      config = (await fetchConfig(
+        this.hass.connection,
+        urlPath,
+        false
+      )) as LovelaceConfig;
+    } catch (_err: any) {
+      config = undefined;
+    }
+    // Responses can resolve out of order.
+    if (urlPath !== this._urlPath) {
+      return;
+    }
+    this._config = config;
+    this._selectedViewIdx = 0;
+    this._loading = false;
+  }
+
+  private _viewChanged(ev: CustomEvent<number>) {
+    this._selectedViewIdx = ev.detail;
+  }
+
+  private _selectView(): void {
+    const config = this._selectableConfig;
+    if (!config) {
+      return;
+    }
+    fireEvent(this, "view-selected", { view: this._selectedViewIdx });
+    this._params!.viewSelectedCallback(
+      this._urlPath!,
+      config,
+      this._selectedViewIdx
+    );
+    this.closeDialog();
+  }
+
+  static get styles(): CSSResultGroup {
+    return [
+      haStyleDialog,
+      css`
+        ha-select {
+          width: 100%;
+          margin-bottom: var(--ha-space-4);
+        }
+        h3,
+        ha-alert {
+          display: block;
+          margin: var(--ha-space-4) 0;
+        }
+        .loading {
+          display: flex;
+          justify-content: center;
+        }
+      `,
+    ];
+  }
+}
+
+declare global {
+  interface HTMLElementTagNameMap {
+    "hui-dialog-select-view": HuiDialogSelectView;
+  }
+}
